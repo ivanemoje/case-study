@@ -1,0 +1,43 @@
+# Local environment files
+.local/
+
+# VS Code workspace files
+*.code-workspace
+
+# macOS and editor noise
+.DS_Store
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+*.ipynb
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfvars
+*.tfvars.json
+*.terraform.lock.hcl
+
+# Packaging and deployment artifacts
+build/
+dist/
+*.zip
+
+# Environment files
+.env
+.env.*
+
+# data
+*.csv
