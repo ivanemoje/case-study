@@ -13,7 +13,3 @@ output "trigger_glue_zip_function_name" {
 output "trigger_glue_zip_function_arn" {
   value = aws_lambda_function.trigger_glue_zip.arn
 }
-
-output "ses_sender_function_name" {
-  value = aws_lambda_function.ses_sender.function_name
-}

@@ -1,6 +1,6 @@
 variable "aws_region" {
   type    = string
-  default = "eu-central-2"
+  default = "eu-central-1"
 }
 
 variable "project" {
@@ -9,12 +9,12 @@ variable "project" {
 }
 
 variable "data_bucket_name" {
-  description = "Main data lake bucket name — must be globally unique"
+  description = "Main data lake bucket name; must be globally unique"
   type        = string
 }
 
 variable "athena_results_bucket_name" {
-  description = "Athena results bucket name — must be globally unique"
+  description = "Athena results bucket name; must be globally unique"
   type        = string
 }
 
@@ -34,11 +34,6 @@ variable "source_data_url" {
 }
 
 variable "notification_email" {
-  description = "Email to receive pipeline notifications. Must verify via the SES confirmation email after first apply."
-  type        = string
-}
-
-variable "ses_from_email" {
-  description = "Verified SES sender address. Can be the same as notification_email."
+  description = "Email subscribed directly to the pipeline SNS topic"
   type        = string
 }

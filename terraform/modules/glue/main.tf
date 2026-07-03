@@ -1,12 +1,22 @@
 locals {
   warehouse = "s3://${var.lake_bucket_id}/"
 
-  iceberg_conf = "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.glue_catalog.warehouse=${local.warehouse} --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO"
+  iceberg_conf = join(" --conf ", [
+    "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+    "spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog",
+    "spark.sql.catalog.glue_catalog.warehouse=${local.warehouse}",
+    "spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog",
+    "spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO",
+    "spark.sql.adaptive.enabled=true",
+    "spark.sql.adaptive.coalescePartitions.enabled=true",
+    "spark.sql.adaptive.advisoryPartitionSizeInBytes=134217728",
+    "spark.sql.sources.partitionOverwriteMode=dynamic",
+  ])
 }
 
 resource "aws_glue_catalog_database" "lake" {
   name        = var.glue_database_name
-  description = "IATA case study medallion lake — bronze, silver, quarantine"
+  description = "IATA case study lake: bronze, silver, and quarantine"
 }
 
 resource "aws_s3_object" "zip_to_bronze_script" {
@@ -31,6 +41,10 @@ resource "aws_glue_job" "zip_to_bronze" {
   number_of_workers = 4
   timeout           = 60
 
+  execution_property {
+    max_concurrent_runs = 2
+  }
+
   command {
     script_location = "s3://${var.lake_bucket_id}/glue-scripts/zip_to_bronze.py"
     python_version  = "3"
@@ -41,15 +55,18 @@ resource "aws_glue_job" "zip_to_bronze" {
     "--enable-metrics"                   = ""
     "--enable-continuous-cloudwatch-log" = "true"
     "--enable-glue-datacatalog"          = "true"
+    "--enable-auto-scaling"              = "true"
     "--datalake-formats"                 = "iceberg"
     "--conf"                             = local.iceberg_conf
     "--BUCKET_NAME"                      = var.lake_bucket_id
     "--GLUE_DATABASE"                    = var.glue_database_name
     "--BRONZE_TABLE"                     = "sales_bronze"
     "--BRONZE_PREFIX"                    = "bronze/"
-    "--RAW_KEY"                          = "raw/placeholder.zip"
+    "--LANDING_KEY"                      = "landing/placeholder.zip"
+    "--ARCHIVE_PREFIX"                   = "archive/"
+    "--STAGING_PREFIX"                   = "staging/extracted/"
     "--LEDGER_TABLE"                     = var.processed_files_table_name
-    "--SNS_TOPIC_ARN"                    = var.landing_topic_arn
+    "--SNS_TOPIC_ARN"                    = var.notification_topic_arn
     "--AWS_REGION"                       = var.aws_region
     "--NEXT_JOB_NAME"                    = aws_glue_job.bronze_to_silver.name
   }
@@ -65,6 +82,10 @@ resource "aws_glue_job" "bronze_to_silver" {
   number_of_workers = 2
   timeout           = 60
 
+  execution_property {
+    max_concurrent_runs = 1
+  }
+
   command {
     script_location = "s3://${var.lake_bucket_id}/glue-scripts/bronze_to_silver.py"
     python_version  = "3"
@@ -75,6 +96,7 @@ resource "aws_glue_job" "bronze_to_silver" {
     "--enable-metrics"                   = ""
     "--enable-continuous-cloudwatch-log" = "true"
     "--enable-glue-datacatalog"          = "true"
+    "--enable-auto-scaling"              = "true"
     "--datalake-formats"                 = "iceberg"
     "--conf"                             = local.iceberg_conf
     "--BUCKET_NAME"                      = var.lake_bucket_id
@@ -84,7 +106,7 @@ resource "aws_glue_job" "bronze_to_silver" {
     "--SILVER_PREFIX"                    = "silver/"
     "--QUARANTINE_TABLE"                 = "sales_quarantine"
     "--QUARANTINE_PREFIX"                = "quarantine/"
-    "--SNS_TOPIC_ARN"                    = var.silver_topic_arn
+    "--SNS_TOPIC_ARN"                    = var.notification_topic_arn
     "--AWS_REGION"                       = var.aws_region
   }
 

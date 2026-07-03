@@ -30,14 +30,10 @@ output "lambda_trigger_glue_zip_name" {
   value = module.lambda.trigger_glue_zip_function_name
 }
 
-output "lambda_ses_sender_name" {
-  value = module.lambda.ses_sender_function_name
-}
-
 output "processed_files_table_name" {
   value = module.s3.processed_files_table_name
 }
 
-output "ses_verification_reminder" {
-  value = "IMPORTANT: Check the inbox for ${var.ses_from_email} and ${var.notification_email} — AWS sent verification emails. Click the links. Notifications will silently fail to send until both addresses are verified."
+output "sns_subscription_reminder" {
+  value = "Confirm the Amazon SNS subscription sent to ${var.notification_email}; pipeline emails will not arrive until it is confirmed."
 }

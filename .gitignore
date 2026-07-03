@@ -41,3 +41,5 @@ dist/
 
 # data
 *.csv
+
+data/

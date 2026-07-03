@@ -1,164 +1,168 @@
-"""
-lambdas/acquire/handler.py
-────────────────────────────
-1. Downloads the zip from SOURCE_URL (stays compressed — no extraction here)
-2. Computes SHA256 of the zip bytes
-3. Checks the DynamoDB ledger — if this checksum was already processed,
-   skips the upload entirely and publishes a "skipped" notification
-4. Otherwise uploads the zip as-is to raw/<original-or-derived-name>.zip
-   and writes a ledger entry (status=uploaded — the zip_to_bronze Glue
-   job updates this to status=completed once it succeeds)
-5. Publishes a result message to SNS (success or failure) for the
-   ses_sender Lambda to turn into an email
+"""Download the source ZIP, deduplicate it by SHA256, and place it in landing/."""
 
-Why the zip is NOT extracted here: CSV extraction for "big data" sized
-files belongs in Glue, which has Spark's distributed memory management
-instead of Lambda's fixed memory/disk ceiling. Lambda's only job is to
-get the file into S3 reliably and record what it did.
-"""
-
-import boto3
 import hashlib
-import json
 import logging
 import os
+import tempfile
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
+
+import boto3
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-BUCKET_NAME   = os.environ["BUCKET_NAME"]
-SOURCE_URL    = os.environ["SOURCE_URL"]
-LEDGER_TABLE  = os.environ["LEDGER_TABLE"]
+BUCKET_NAME = os.environ["BUCKET_NAME"]
+SOURCE_URL = os.environ["SOURCE_URL"]
+LEDGER_TABLE = os.environ["LEDGER_TABLE"]
 SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
 
-s3        = boto3.client("s3")
-dynamodb  = boto3.resource("dynamodb")
-sns       = boto3.client("sns")
-ledger    = dynamodb.Table(LEDGER_TABLE)
+s3 = boto3.client("s3")
+dynamodb = boto3.resource("dynamodb")
+sns = boto3.client("sns")
+ledger = dynamodb.Table(LEDGER_TABLE)
 
 
 def lambda_handler(event, context):
-    run_ts  = datetime.now(timezone.utc)
+    run_ts = datetime.now(timezone.utc)
     run_str = run_ts.strftime("%Y%m%dT%H%M%SZ")
+    local_path: Path | None = None
 
     try:
-        logger.info("Acquire started: %s  source: %s", run_str, SOURCE_URL)
+        logger.info("Acquire started at %s from %s", run_str, SOURCE_URL)
+        local_path, checksum, size_bytes = _download_to_temp(SOURCE_URL)
+        existing = _get_ledger_item(checksum)
 
-        zip_bytes = _download(SOURCE_URL)
-        checksum  = hashlib.sha256(zip_bytes).hexdigest()
-        logger.info("Downloaded %d bytes, SHA256=%s", len(zip_bytes), checksum)
-
-        existing = _check_ledger(checksum)
-        if existing:
-            logger.info("Checksum already processed at %s — skipping upload",
-                        existing.get("processed_at"))
-            _notify(
-                subject="IATA Pipeline — Acquire SKIPPED (duplicate)",
-                message=(
-                    f"File with checksum {checksum} was already processed.\n"
-                    f"Original upload: {existing.get('raw_key')}\n"
-                    f"Originally processed at: {existing.get('processed_at')}\n"
-                    f"No new upload was made."
-                ),
-                status="SKIPPED",
+        if existing and existing.get("status") in {
+            "uploaded",
+            "processing",
+            "bronze_loaded",
+            "completed",
+        }:
+            detail = (
+                f"File checksum {checksum} is already registered.\n"
+                f"Status: {existing.get('status')}\n"
+                f"Landing key: {existing.get('landing_key', 'n/a')}\n"
+                f"Archive key: {existing.get('archive_key', 'n/a')}\n"
+                "No duplicate upload was made."
             )
+            _notify("IATA Pipeline — Acquire SKIPPED", "SKIPPED", detail)
             return {
                 "statusCode": 200,
                 "status": "skipped_duplicate",
                 "checksum": checksum,
-                "existing_raw_key": existing.get("raw_key"),
             }
 
-        raw_key = f"raw/sales_{run_str}.zip"
-        _put_s3(raw_key, zip_bytes)
-        logger.info("Uploaded → s3://%s/%s", BUCKET_NAME, raw_key)
-
-        _write_ledger(checksum, raw_key, run_ts)
-
-        _notify(
-            subject="IATA Pipeline — Acquire SUCCEEDED",
-            message=(
-                f"Downloaded and uploaded new file.\n"
-                f"Checksum: {checksum}\n"
-                f"S3 key: {raw_key}\n"
-                f"Size: {len(zip_bytes)} bytes\n"
-                f"This will automatically trigger the zip-to-bronze Glue job "
-                f"via EventBridge."
-            ),
-            status="SUCCESS",
+        landing_key = (
+            f"landing/ingest_date={run_ts:%Y-%m-%d}/sales_{run_str}.zip"
         )
+        _upload_file(local_path, landing_key)
+        _write_ledger(checksum, landing_key, run_ts, size_bytes)
+
+        detail = (
+            "Downloaded and uploaded a new source archive.\n"
+            f"Checksum: {checksum}\n"
+            f"S3 key: {landing_key}\n"
+            f"Size: {size_bytes} bytes\n"
+            "The landing event will start the ZIP-to-bronze Glue job."
+        )
+        _notify("IATA Pipeline — Acquire SUCCEEDED", "SUCCESS", detail)
 
         return {
             "statusCode": 200,
             "status": "uploaded",
-            "raw_key": raw_key,
+            "landing_key": landing_key,
             "checksum": checksum,
         }
 
     except Exception as exc:
         logger.exception("Acquire failed")
         _notify(
-            subject="IATA Pipeline — Acquire FAILED",
-            message=f"Acquire Lambda failed at {run_str}.\n\nError: {exc}",
-            status="FAILURE",
+            "IATA Pipeline — Acquire FAILED",
+            "FAILURE",
+            f"Acquire failed at {run_str}.\n\nError: {exc}",
         )
         raise
+    finally:
+        if local_path:
+            local_path.unlink(missing_ok=True)
 
 
-def _download(url: str) -> bytes:
-    logger.info("Fetching %s", url)
-    req = urllib.request.Request(
+def _download_to_temp(url: str) -> tuple[Path, str, int]:
+    """Stream the ZIP to /tmp while calculating SHA256; do not hold it in memory."""
+    digest = hashlib.sha256()
+    size_bytes = 0
+
+    request = urllib.request.Request(
         url,
         headers={"User-Agent": "Mozilla/5.0 (compatible; IATA-Pipeline/1.0)"},
     )
-    with urllib.request.urlopen(req, timeout=120) as r:
-        if r.status != 200:
-            raise RuntimeError(f"HTTP {r.status} from {url}")
-        return r.read()
+
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as target:
+        local_path = Path(target.name)
+        with urllib.request.urlopen(request, timeout=120) as response:
+            if response.status != 200:
+                raise RuntimeError(f"HTTP {response.status} from {url}")
+            while chunk := response.read(8 * 1024 * 1024):
+                target.write(chunk)
+                digest.update(chunk)
+                size_bytes += len(chunk)
+
+    checksum = digest.hexdigest()
+    logger.info("Downloaded %d bytes, SHA256=%s", size_bytes, checksum)
+    return local_path, checksum, size_bytes
 
 
-def _check_ledger(checksum: str) -> dict | None:
+def _get_ledger_item(checksum: str) -> dict | None:
     try:
-        response = ledger.get_item(Key={"checksum_sha256": checksum})
-        return response.get("Item")
+        return ledger.get_item(Key={"checksum_sha256": checksum}).get("Item")
     except Exception as exc:
-        logger.error("Ledger check failed (treating as not-processed): %s", exc)
+        logger.error("Ledger lookup failed; proceeding as new data: %s", exc)
         return None
 
 
-def _write_ledger(checksum: str, raw_key: str, processed_at: datetime) -> None:
-    ledger.put_item(Item={
-        "checksum_sha256": checksum,
-        "raw_key":         raw_key,
-        "processed_at":    processed_at.isoformat(),
-        "status":          "uploaded",
-    })
-
-
-def _put_s3(key: str, body: bytes) -> None:
-    s3.put_object(
-        Bucket=BUCKET_NAME,
-        Key=key,
-        Body=body,
-        ContentType="application/zip",
-        ServerSideEncryption="AES256",
+def _write_ledger(
+    checksum: str,
+    landing_key: str,
+    uploaded_at: datetime,
+    size_bytes: int,
+) -> None:
+    ledger.put_item(
+        Item={
+            "checksum_sha256": checksum,
+            "landing_key": landing_key,
+            "uploaded_at": uploaded_at.isoformat(),
+            "size_bytes": size_bytes,
+            "status": "uploaded",
+        }
     )
 
 
-def _notify(subject: str, message: str, status: str) -> None:
+def _upload_file(local_path: Path, key: str) -> None:
+    s3.upload_file(
+        str(local_path),
+        BUCKET_NAME,
+        key,
+        ExtraArgs={
+            "ContentType": "application/zip",
+            "ServerSideEncryption": "AES256",
+        },
+    )
+    logger.info("Uploaded s3://%s/%s", BUCKET_NAME, key)
+
+
+def _notify(subject: str, status: str, detail: str) -> None:
     try:
         sns.publish(
             TopicArn=SNS_TOPIC_ARN,
             Subject=subject,
-            Message=json.dumps({
-                "stage": "acquire",
-                "status": status,
-                "detail": message,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }),
+            Message=(
+                "Stage: acquire\n"
+                f"Status: {status}\n"
+                f"Timestamp: {datetime.now(timezone.utc).isoformat()}\n\n"
+                f"{detail}"
+            ),
         )
     except Exception as exc:
-        # Notification failure should never fail the pipeline itself
         logger.error("SNS publish failed: %s", exc)
